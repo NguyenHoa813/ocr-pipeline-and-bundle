@@ -1,0 +1,33 @@
+# Python environments and generated package files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local model weights and inference caches
+/cache/
+
+# Pipeline outputs
+/work/
+/storage/
+/storage-*/
+/raw/
+
+# Local scan data and real-data test batches
+/10_11_2026_Hoa/
+/temp-real-*/
+
+# Local environment settings
+.env
+.env.*
+!.env.example

@@ -1,0 +1,1 @@
+"""Optional OCR model adapters."""
