@@ -171,10 +171,12 @@ downstream OCR must skip flagged pages while retaining their page markers.
 
 ## Step 4: OCR pages
 
-Install the local PaddleOCR plugin and CPU runtime from the project root:
+Install the OCR dependencies from the project root:
 
 ```powershell
-python -m pip install -e ".[paddle]"
+python -m pip install -e ".[layout,tesseract]"
+python -m pip install --no-deps vietocr==0.3.13
+python -m pip install gdown einops prefetch-generator lmdb
 ```
 
 Run Step 4 after Steps 1-3:
@@ -183,70 +185,70 @@ Run Step 4 after Steps 1-3:
 python -m ocr_pipeline ocr-document `
   --batch "F:\ocr\batch01" `
   --document-id "B0012-01-01" `
-  --model paddle `
-  --language vi
+  --model vietocr `
+  --language "vi+zh-Hant"
 ```
 
-Choose `vi`, `zh-Hant`, `fr`, or `en` for the document language. The adapter
-uses the PP-OCRv6 detector and recognition model for English and Traditional
-Chinese. Since PP-OCRv6's medium recognition model only supports English and
-Chinese, Vietnamese and French use PaddleOCR's Latin PP-OCRv5 recognizer.
-PP-StructureV3 adds layout, table, formula, and seal recognition so Step 4 can
-emit normalized regions for text, table, formula, figure, stamp, page header,
-page footer, and page number. The page Markdown and each PaddleOCR result JSON
-are written under `<batch>\work\step-4-ocr\<document-id>`; raw results remain
-local. Text detection uses a 1600-pixel maximum side length to retain details
-in high-resolution scans. This model combination can still miss Vietnamese
-diacritics; Step 8 checks bundle structure, not OCR transcription accuracy, so
-review the Markdown against the source scans before publication.
-The first run downloads model weights to `<project>\cache\paddlex`. The
-adapter sets `PADDLE_PDX_CACHE_HOME` before importing PaddleOCR/PaddleX.
-MKL-DNN is disabled by default because this PaddlePaddle CPU runtime raised an
-unsupported PIR attribute error with oneDNN. This is a CPU installation; a GPU
-PaddlePaddle runtime is a separate platform setup.
+Use `vi` for Vietnamese-only pages or `vi+zh-Hant` for pages mixing Vietnamese
+with Traditional Chinese. VietOCR recognizes Vietnamese line crops, Tesseract
+detects text lines and recognizes Traditional Chinese, and PaddleOCR
+PP-StructureV3 supplies layout regions only. PaddleOCR's recognized text is
+discarded so it cannot override VietOCR's text. Figure, table, formula, stamp,
+header, footer, and page-number regions are kept for downstream steps. Raw
+responses from both OCR and layout passes remain local.
 
-Step 4 is adapter-based. `paddle` is built in; other adapter distributions can
-register an entry point in the `ocr_pipeline.ocr_adapters` group and implement
-the `OCRModelAdapter` interface. The built-in `tesseract` and `easyocr`
-adapters can be selected with `--model`; install each optional Python runtime
-from the project root:
+Step 4 logs each page's status and elapsed time as it completes. The same
+`duration_seconds` value is stored per page in `ocr-report.json`, including
+failed pages; blank pages record the time spent handling the skip.
 
-```powershell
-python -m pip install -e ".[tesseract]"
-python -m pip install -e ".[easyocr]"
-```
+VietOCR's `vgg_transformer.pth` weights are downloaded on first use into
+`<project>\cache\vietocr`; PaddleOCR layout weights go into
+`<project>\cache\paddlex`. Tesseract 5 and its `vie` and `chi_tra` language
+data must be installed on the workstation. Set `TESSERACT_CMD` if
+`tesseract.exe` is not on `PATH`. PaddleOCR is configured as a CPU layout
+provider; MKL-DNN is disabled because this PaddlePaddle CPU runtime raised an
+unsupported PIR attribute error with oneDNN. GPU PaddlePaddle is a separate
+platform setup.
 
-Tesseract also requires the Tesseract 5 executable and language data installed
-on the workstation. Install the language packs `vie`, `chi_tra`, `fra`, and
-`eng` as needed; set `TESSERACT_CMD` if `tesseract.exe` is not on `PATH`.
-EasyOCR downloads its recognition weights on first use into
-`<project>\cache\easyocr`; the selected language weights must be available
-locally before an offline run.
+The adapter architecture remains extensible: other adapter distributions can
+register an entry point in `ocr_pipeline.ocr_adapters` and implement the
+`OCRModelAdapter` interface. The built-in `tesseract` model can also be chosen
+for Tesseract-only text recognition; it does not run PaddleOCR layout, so Step
+5 will not receive figure regions in that mode.
 
-Run both engines against the same split document, using separate output
-folders so each report and raw response is retained for comparison:
+VietOCR's library is Apache 2.0; check the weights terms before production
+use. On the page-37 sample, the mixed profile reads the Traditional Chinese
+quotation `乾。元亨利貞。` and improves the title and Vietnamese diacritics
+compared with Tesseract-only recognition. Validate the choice on a larger
+sample with a reviewed reference before production.
 
-```powershell
-python -m ocr_pipeline ocr-document `
-  --batch "F:\ocr\batch01" `
-  --document-id "B0012-01-01" `
-  --model tesseract `
-  --language vi `
-  --output "F:\ocr\batch01\work\step-4-tesseract\B0012-01-01"
+### OCR quality tuning
 
-python -m ocr_pipeline ocr-document `
-  --batch "F:\ocr\batch01" `
-  --document-id "B0012-01-01" `
-  --model easyocr `
-  --language vi `
-  --output "F:\ocr\batch01\work\step-4-easyocr\B0012-01-01"
-```
+The VietOCR and Tesseract adapters share a page preparation step before text
+inference. The first TIFF frame is converted to grayscale, autocontrasted when
+the page is low-contrast, upscaled when the page is small, and deskewed by up
+to 5 degrees using a projection-profile search. The prepared image is never
+written to disk and the original TIFF is never modified. Their text boxes are
+normalized against the page frame. PaddleOCR layout inference keeps the
+original scale and rotation so figure boxes map onto the master TIFF. Raw
+outputs record the preprocessing metadata for both passes.
 
-Both alternatives produce Markdown, text regions with normalized bounding
-boxes, model metadata, and local raw results. They are text OCR engines, not
-document-layout models: unlike PaddleOCR PP-StructureV3, they do not detect
-figure, table, formula, stamp, header, or footer regions. Consequently their
-Step 5 runs cannot crop figures that the engine did not identify.
+Engine-specific tuning:
+
+- Tesseract uses the LSTM engine (`--oem 1`), automatic page segmentation
+  (`--psm 3`), preserved interword spacing and a declared 300 DPI, and emits
+  one region per visual line grouped into paragraphs by Tesseract's block and
+  paragraph numbers.
+- VietOCR uses its `vgg_transformer` model for Vietnamese line recognition;
+  mixed mode sends Traditional Chinese lines to Tesseract `chi_tra`.
+- PaddleOCR PP-StructureV3 provides layout and geometry only. Its text
+  transcription is discarded so the final Markdown comes from VietOCR.
+
+The page-37 trial favored the VietOCR/Tesseract combination for mixed
+Vietnamese and Traditional Chinese. PaddleOCR remains in the pipeline only
+because it supplies layout regions for downstream figure extraction. Confirm
+the quality ranking on a larger sample with reviewed ground truth; Chandra
+OCR 2 remains the separately specified production target.
 
 ## Step 5: cut out figures
 

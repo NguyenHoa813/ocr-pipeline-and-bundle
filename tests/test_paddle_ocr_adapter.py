@@ -211,7 +211,9 @@ class PaddleOCRAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(Step4Error, "out-of-page") as context:
                 adapter.recognize(image_path)
 
-        self.assertEqual(context.exception.raw_response, raw_result)
+        raw_response = context.exception.raw_response
+        self.assertIsInstance(raw_response, dict)
+        self.assertEqual(raw_response["result"], raw_result)
         self.assertEqual(
             adapter._engine.options["text_det_limit_side_len"],
             TEXT_DET_LIMIT_SIDE_LEN,

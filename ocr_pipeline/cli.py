@@ -1,4 +1,5 @@
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -167,13 +168,14 @@ def build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--document-id", required=True)
     ocr.add_argument(
         "--model",
-        default="paddle",
-        help="OCR plugin name (default: paddle).",
+        default="vietocr",
+        help="OCR plugin name (default: vietocr with Tesseract and Paddle layout).",
     )
     ocr.add_argument(
         "--language",
         default="vi",
-        help="Language code supported by the selected OCR adapter (vi, zh-Hant, fr, en).",
+        help="Language supported by the selected model (vietocr: vi or "
+        "vi+zh-Hant; tesseract: vi, vi+zh-Hant, zh-Hant, fr, en).",
     )
     ocr.add_argument("--split-report", type=Path)
     ocr.add_argument("--check-report", type=Path)
@@ -533,6 +535,20 @@ def main(argv: list[str] | None = None) -> int:
             ).resolve()
             if output_folder.is_relative_to(scan_folder):
                 raise Step4Error("OCR output must be outside raw scans.")
+            step4_logger = logging.getLogger(
+                "ocr_pipeline.steps.step4_ocr_pages"
+            )
+            step4_logger.setLevel(logging.INFO)
+            step4_logger.propagate = False
+            if not step4_logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%H:%M:%S",
+                    )
+                )
+                step4_logger.addHandler(handler)
             adapter = load_ocr_adapter(args.model, language=args.language)
             report, normalized, raw = run_document_ocr(
                 batch_root,
@@ -566,7 +582,11 @@ def main(argv: list[str] | None = None) -> int:
                 / f"{args.document_id}.json",
             ],
             [output_folder],
-            {"model": args.model, "language": args.language},
+            {
+                "model": args.model,
+                "language": args.language,
+                **getattr(adapter, "configuration", {}),
+            },
         )
         print(
             f"OCR {report.status} for {args.document_id} with {report.model}; "

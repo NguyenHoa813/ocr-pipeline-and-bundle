@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,11 @@ os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "False"
 
 from PIL import Image, UnidentifiedImageError
 
+from ocr_pipeline.adapters.preprocess import PreparedPage, prepare_page
+from ocr_pipeline.adapters.text_layout import (
+    is_noise_text,
+    normalize_text,
+)
 from ocr_pipeline.steps.step4_ocr_pages import (
     ImageKind,
     LayoutRegion,
@@ -33,7 +40,7 @@ _RECOGNITION_MODELS = {
     "fr": "latin_PP-OCRv5_mobile_rec",
     "en": "PP-OCRv6_medium_rec",
 }
-TEXT_DET_LIMIT_SIDE_LEN = 1600
+TEXT_DET_LIMIT_SIDE_LEN = 3000
 _LABEL_TYPES: dict[str, RegionType] = {
     "abstract": "text",
     "aside_text": "text",
@@ -142,6 +149,13 @@ def _normalized_bbox(
     return [x0 / width, y0 / height, x1 / width, y1 / height]
 
 
+def _clean_block_text(text: str, region_type: RegionType) -> str:
+    text = text.strip()
+    if region_type in {"text", "heading"}:
+        return normalize_text(text)
+    return unicodedata.normalize("NFC", text).strip()
+
+
 def _parse_structure_result(
     payload: dict[str, Any],
     width: int,
@@ -168,8 +182,8 @@ def _parse_structure_result(
                 f"PaddleOCR layout block {index} has invalid or out-of-page "
                 "coordinates."
             )
-        text = _block_text(block.get("block_content"))
         region_type = _LABEL_TYPES.get(label.lower().replace(" ", "_"), "text")
+        text = _clean_block_text(_block_text(block.get("block_content")), region_type)
         image_kind: ImageKind | None = None
         if region_type == "figure":
             if label.lower() in {"chart", "diagram", "drawing"}:
@@ -184,7 +198,9 @@ def _parse_structure_result(
                 image_kind=image_kind,
             )
         )
-        if text:
+        if text and not (
+            region_type in {"text", "heading"} and is_noise_text(text)
+        ):
             if region_type == "heading":
                 markdown_blocks.append(f"## {text}")
             elif region_type == "formula":
@@ -205,7 +221,18 @@ class PaddleOCRAdapter:
     model_version = "PP-OCRv6_medium_det + PP-OCRv6_medium_rec + PP-StructureV3"
     _engine: Any
 
-    def __init__(self, language: str = "vi") -> None:
+    def __init__(
+        self,
+        language: str = "vi",
+        preprocess: bool = True,
+        min_text_side: int = 0,
+    ) -> None:
+        if language == "vi+zh-Hant":
+            raise Step4Error(
+                "PaddleOCR cannot mix Vietnamese and Traditional Chinese "
+                "in one run. Use `--model vietocr --language vi+zh-Hant` "
+                "or run separate `vi` and `zh-Hant` passes."
+            )
         if language not in _LANGUAGES:
             raise Step4Error(
                 "PaddleOCR language must be one of: "
@@ -215,10 +242,17 @@ class PaddleOCRAdapter:
         self.language = language
         self.paddle_language = _LANGUAGES[language]
         self.text_recognition_model_name = _RECOGNITION_MODELS[language]
+        self.preprocess = preprocess
+        self.min_text_side = min_text_side
         self.model_version = (
             f"PP-OCRv6_medium_det + {self.text_recognition_model_name} "
             "+ PP-StructureV3"
         )
+        self.configuration = {
+            "preprocess": self.preprocess,
+            "min_text_side": self.min_text_side,
+            "text_det_limit_side_len": TEXT_DET_LIMIT_SIDE_LEN,
+        }
         try:
             from paddleocr import PPStructureV3
 
@@ -240,11 +274,32 @@ class PaddleOCRAdapter:
 
     def recognize(self, image_path: Path) -> tuple[PageOCRContent, object]:
         raw_response: object | None = None
+        temporary_path: Path | None = None
         try:
-            with Image.open(image_path) as image:
-                width, height = image.size
+            if getattr(self, "preprocess", True):
+                prepared: PreparedPage = prepare_page(
+                    image_path,
+                    min_text_side=getattr(self, "min_text_side", 0),
+                    deskew=False,
+                    grayscale=False,
+                )
+                preprocess_metadata = prepared.metadata()
+                with tempfile.NamedTemporaryFile(
+                    suffix=".png",
+                    prefix="ocr-page-",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                prepared.image.save(temporary_path, format="PNG")
+                width, height = prepared.size
+                predict_input = str(temporary_path)
+            else:
+                preprocess_metadata = {"mode": "disabled"}
+                with Image.open(image_path) as image:
+                    width, height = image.size
+                predict_input = str(image_path)
             results = self._engine.predict(
-                input=str(image_path),
+                input=predict_input,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
@@ -254,8 +309,15 @@ class PaddleOCRAdapter:
             result_list = list(results)
             if not result_list:
                 raise Step4Error("PaddleOCR returned no page result.")
-            raw_response = _paddle_result_payload(result_list[0])
-            content = _parse_structure_result(raw_response, width, height)
+            model_payload = _paddle_result_payload(result_list[0])
+            raw_response = {
+                "engine": self.model_name,
+                "version": self.model_version,
+                "language": getattr(self, "language", None),
+                "preprocess": preprocess_metadata,
+                "result": model_payload,
+            }
+            content = _parse_structure_result(model_payload, width, height)
             return content, raw_response
         except Step4Error as exc:
             if exc.raw_response is not None:
@@ -271,3 +333,6 @@ class PaddleOCRAdapter:
             raise Step4Error(
                 f"PaddleOCR inference failed for {image_path}: {exc}"
             ) from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)

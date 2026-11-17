@@ -9,27 +9,26 @@ description = "Local-first OCR document processing pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "Pillow>=10.0",
+    "numpy>=1.24",
     "PyYAML>=6.0",
     "zxing-cpp>=2.2",
 ]
 
 [project.optional-dependencies]
 vertex = ["google-genai>=1.0"]
-paddle = [
+layout = [
     "paddleocr>=3.7.0,<4",
     "paddlepaddle>=3.3.1,<4",
     "paddlex[ocr]>=3.7.0,<3.8.0",
 ]
 tesseract = ["pytesseract>=0.3.13,<1"]
-easyocr = ["easyocr>=1.7.2,<2"]
 
 [project.scripts]
 ocr-pipeline = "ocr_pipeline.cli:main"
 
 [project.entry-points."ocr_pipeline.ocr_adapters"]
-paddle = "ocr_pipeline.adapters.paddle_ocr:PaddleOCRAdapter"
 tesseract = "ocr_pipeline.adapters.tesseract_ocr:TesseractOCRAdapter"
-easyocr = "ocr_pipeline.adapters.easyocr:EasyOCRAdapter"
+vietocr = "ocr_pipeline.adapters.vietocr_layout:VietOCRLayoutAdapter"
 
 [tool.setuptools.packages.find]
 include = ["ocr_pipeline*"]

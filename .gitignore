@@ -25,7 +25,12 @@ htmlcov/
 
 # Local scan data and real-data test batches
 /10_11_2026_Hoa/
+/temp-full-pipeline-*/
 /temp-real-*/
+/temp-vietocr-*/
+
+# Generated end-to-end self-test batches
+/ocr-pipeline-self-test-run-*/
 
 # Local environment settings
 .env

@@ -1,5 +1,7 @@
 import json
+import logging
 import re
+import time
 from dataclasses import asdict, dataclass
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -9,6 +11,7 @@ from ocr_pipeline.steps.step1_check_batch import resolve_scan_folder
 
 
 OCR_ADAPTER_ENTRY_POINT_GROUP = "ocr_pipeline.ocr_adapters"
+_LOGGER = logging.getLogger(__name__)
 
 
 class Step4Error(Exception):
@@ -64,12 +67,14 @@ class OCRModelAdapter(Protocol):
 def load_ocr_adapter(model_name: str, **options: object) -> OCRModelAdapter:
     """Load a built-in or installed third-party OCR adapter plugin."""
     builtin_adapters: dict[str, tuple[str, str]] = {
-        "paddle": ("ocr_pipeline.adapters.paddle_ocr", "PaddleOCRAdapter"),
         "tesseract": (
             "ocr_pipeline.adapters.tesseract_ocr",
             "TesseractOCRAdapter",
         ),
-        "easyocr": ("ocr_pipeline.adapters.easyocr", "EasyOCRAdapter"),
+        "vietocr": (
+            "ocr_pipeline.adapters.vietocr_layout",
+            "VietOCRLayoutAdapter",
+        ),
     }
     if model_name in builtin_adapters:
         module_name, class_name = builtin_adapters[model_name]
@@ -142,6 +147,7 @@ class PageOCRResult:
     markdown_file: str
     raw_output_file: str | None
     error: str | None = None
+    duration_seconds: float | None = None
 
 
 @dataclass
@@ -318,6 +324,7 @@ def run_document_ocr(
     normalized_outputs: dict[int, PageOCRContent] = {}
     raw_outputs: dict[int, object] = {}
     for page_number in pages:
+        page_started = time.perf_counter()
         relative_file = scan_paths.get(page_number)
         if relative_file is None:
             raise Step4Error(
@@ -333,6 +340,7 @@ def run_document_ocr(
             raise Step4Error(f"Scan file is missing: {image_path}")
         markdown_relative = f"pages/page-{page_number:05d}.md"
         if page_number in blank_pages:
+            duration_seconds = round(time.perf_counter() - page_started, 3)
             normalized_outputs[page_number] = PageOCRContent(
                 markdown="",
                 regions=[],
@@ -344,11 +352,18 @@ def run_document_ocr(
                     status="blank",
                     markdown_file=markdown_relative,
                     raw_output_file=None,
+                    duration_seconds=duration_seconds,
                 )
+            )
+            _LOGGER.info(
+                "OCR page %05d: blank (%.3f seconds)",
+                page_number,
+                duration_seconds,
             )
             continue
         try:
             content, raw_output = adapter.recognize(image_path)
+            duration_seconds = round(time.perf_counter() - page_started, 3)
             normalized_outputs[page_number] = content
             raw_outputs[page_number] = raw_output
             page_results.append(
@@ -358,9 +373,16 @@ def run_document_ocr(
                     status="success",
                     markdown_file=markdown_relative,
                     raw_output_file=f"raw/page-{page_number:05d}.json",
+                    duration_seconds=duration_seconds,
                 )
             )
+            _LOGGER.info(
+                "OCR page %05d: success (%.3f seconds)",
+                page_number,
+                duration_seconds,
+            )
         except Step4Error as exc:
+            duration_seconds = round(time.perf_counter() - page_started, 3)
             raw_response = getattr(exc, "raw_response", None)
             if raw_response is not None:
                 raw_outputs[page_number] = raw_response
@@ -376,7 +398,14 @@ def run_document_ocr(
                         else None
                     ),
                     error=str(exc),
+                    duration_seconds=duration_seconds,
                 )
+            )
+            _LOGGER.info(
+                "OCR page %05d: failed (%.3f seconds): %s",
+                page_number,
+                duration_seconds,
+                exc,
             )
 
     overall_status: Literal["pass", "fail"] = (
