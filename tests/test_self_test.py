@@ -14,7 +14,7 @@ class GeneratedPipelineTests(unittest.TestCase):
             result = run_self_test(output, "run-test")
 
             self.assertEqual(result.status, "pass")
-            self.assertEqual(len(result.checks), 9)
+            self.assertEqual(len(result.checks), 10)
             self.assertTrue((result.batch_root / "raw" / "B0012" / "01").is_dir())
             self.assertTrue((result.published_bundle / "document.md").is_file())
             report = json.loads(
@@ -30,7 +30,7 @@ class GeneratedPipelineTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(
-                {f"step-{step}" for step in range(1, 10)},
+                {f"step-{step}" for step in range(1, 10)} | {"step-4.1"},
                 set(run_record["steps"]),
             )
 

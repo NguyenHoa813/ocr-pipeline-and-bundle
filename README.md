@@ -200,6 +200,143 @@ responses from both OCR and layout passes remain local.
 Step 4 logs each page's status and elapsed time as it completes. The same
 `duration_seconds` value is stored per page in `ocr-report.json`, including
 failed pages; blank pages record the time spent handling the skip.
+Every OCR adapter, including local and third-party plugins, writes
+`ocr-<run-id>.log` in its output folder. The log records model/version, page
+status and duration, total elapsed time, token usage, reported cost, and
+errors. The elapsed time includes model initialization and OCR output writing,
+but not subsequent pipeline steps. Reusing a run ID appends to the same log.
+
+`ocr-report.json` and the log distinguish unavailable cost from zero. The
+built-in OCR adapters do not receive monetary billing amounts from their
+providers, and local hardware costs are not measured, so their cost is
+`not_reported`. An adapter may implement `cost_usage(raw)` and return
+`ReportedOCRCost(amount, currency)` when the provider reports an amount.
+Totals are reported only when all attempted pages report a cost in the same
+currency; partial data and mixed currencies are never added together. Tokens
+are reported only when available. Consult provider billing for actual charges,
+including failed requests.
+
+### Gemini API OCR (optional)
+
+This mode sends each non-blank page, converted to PNG in memory, to Google's
+Gemini API. Use it only when the document may be sent to that service; requests
+can incur charges. The original TIFF is not modified. Install the optional
+dependency and set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in the process
+environment using your normal secret-management method; do not put keys in
+source files, command history, or reports.
+
+```powershell
+python -m pip install -e ".[gemini]"
+python -m ocr_pipeline ocr-document `
+  --batch "F:\ocr\batch01" `
+  --document-id "B0012-01-01" `
+  --model gemini `
+  --gemini-model "gemini-4-hydrogen" `
+  --gemini-thinking "low" `
+  --language "vi+zh-Hant" `
+  --run-id "gemini-comparison"
+```
+
+The default model is `gemini-4-hydrogen`, with thinking set to `low`. Pass
+`--gemini-model` to select another model ID and `--gemini-thinking` to change
+the level. Confirm the model IDs available to your key and their supported
+settings before a production run.
+
+By default this writes to `<batch>\work\step-4-ocr-gemini\<document-id>`,
+separate from local OCR. Supply `--ocr-output` to later steps when using this
+output. Gemini returns text only in this mode: no bounding boxes or figure
+regions are generated, so Step 5 cannot extract figures from it. Its
+transcription may contain mistakes and should be compared with a reviewed
+reference before evaluating accuracy.
+
+The OCR report contains per-page `token_usage` and document totals based on
+the API's usage metadata: prompt, output, thinking, cached, and total tokens.
+Missing fields are `null`, not zero; totals are `null` if any attempted page
+has no reported usage. Blank pages make no API request. `total_tokens` is the
+provider-reported total, not a sum of the displayed categories. Failed or
+interrupted requests may have unreported billable usage. Token counts are not
+a cost estimate; consult the provider's current model pricing and billing.
+Each Gemini OCR run also appends page status, duration, final status, output
+path and token usage to `ocr-<run-id>.log` in the Gemini output folder. Reusing
+the same run ID appends to that log; API keys are not recorded.
+### OpenAI API OCR (optional)
+
+Install the optional SDK and set `OPENAI_API_KEY` in the process environment.
+Do not put the key in source files or logs. To check the API with a text-only
+request in PowerShell, enter the key without echoing it and run:
+
+```powershell
+python -m pip install -e ".[openai]"
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'OpenAI API key' -AsSecureString)).Password
+python -c "from openai import OpenAI; r = OpenAI().responses.create(model='gpt-4.1-mini', input='Reply exactly: OPENAI_OK', store=False); print('Status:', r.status); print('Response:', r.output_text); print('Usage:', r.usage)"
+```
+
+For OCR, choose a vision-capable model available to your API account:
+
+```powershell
+python -m ocr_pipeline ocr-document `
+  --batch "F:\ocr\batch01" `
+  --document-id "B0012-01-01" `
+  --model openai `
+  --openai-model "gpt-4.1-mini" `
+  --language "vi+zh-Hant" `
+  --run-id "openai-comparison"
+```
+
+OpenAI OCR sends each non-blank page as an in-memory PNG to OpenAI and can
+incur charges. Requests set `store=False`; consult the provider's data
+retention policies before uploading documents. The TIFF is not modified.
+The default model can be overridden with `--openai-model`. This mode returns
+text without bounding boxes or figure regions; it does not guarantee accuracy.
+
+Results are separate from Gemini and local OCR in
+`<batch>\work\step-4-ocr-openai\<document-id>`. Pass that folder as
+`--ocr-output` when using later steps. `ocr-<run-id>.log` records page status,
+duration, final status and reported usage; repeated run IDs append. The report
+records input, output, cached, reasoning and total tokens as returned by the
+API. Cached and reasoning counts are breakdowns, not extra tokens to add to
+the total. Missing usage is `null`, and failed requests may incur unreported
+charges. Token counts are not a cost estimate.
+
+### Claude API OCR (optional)
+
+Install the optional Anthropic SDK and set `ANTHROPIC_API_KEY` in the
+process environment. Do not put the key in source files or logs. To check the
+API with a text-only request in PowerShell, enter the key without echoing it:
+
+```powershell
+python -m pip install -e ".[claude]"
+$env:ANTHROPIC_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'Anthropic API key' -AsSecureString)).Password
+python -c "from anthropic import Anthropic; r=Anthropic().messages.create(model='claude-sonnet-4-5', max_tokens=64, messages=[{'role':'user','content':'Reply exactly: CLAUDE_OK'}]); print('Stop reason:', r.stop_reason); print('Response:', ' '.join(b.text for b in r.content if b.type == 'text')); print('Usage:', r.usage)"
+```
+
+For OCR, choose a vision-capable model available to your API account:
+
+```powershell
+python -m ocr_pipeline ocr-document `
+  --batch "F:\ocr\batch01" `
+  --document-id "B0012-01-01" `
+  --model claude `
+  --claude-model "claude-sonnet-4-5" `
+  --language "vi+zh-Hant" `
+  --run-id "claude-comparison"
+```
+
+Claude OCR sends each non-blank page as an in-memory PNG to Anthropic and can
+incur charges. Review the provider's data retention policies before sending
+documents. The original TIFF is not modified. The model can be overridden with
+`--claude-model`. Responses that are truncated, refused, or contain no text
+fail the page. Output contains no bounding boxes or figure regions and does
+not guarantee accuracy.
+
+Results and `ocr-<run-id>.log` are written separately under
+`<batch>\work\step-4-ocr-claude\<document-id>`. Pass that folder as
+`--ocr-output` when using later steps. The report's prompt token count is the
+sum of Anthropic's input, cache-creation and cache-read tokens; total is this
+sum plus output tokens. Cached tokens are a breakdown of the prompt total and
+thinking tokens are a breakdown of output, not extra tokens to add. If any
+required count is absent, the derived total is `null`. Failed requests may
+incur unreported charges. Token counts are not a cost estimate.
 
 VietOCR's `vgg_transformer.pth` weights are downloaded on first use into
 `<project>\cache\vietocr`; PaddleOCR layout weights go into
@@ -249,6 +386,78 @@ Vietnamese and Traditional Chinese. PaddleOCR remains in the pipeline only
 because it supplies layout regions for downstream figure extraction. Confirm
 the quality ranking on a larger sample with reviewed ground truth; Chandra
 OCR 2 remains the separately specified production target.
+
+## Step 4.1: multilingual spell checking and correction
+
+Step 4.1 reads only Step 4 Markdown and page metadata. It does not invoke OCR,
+open or modify source TIFFs, or change page JSON/layout coordinates. Corrected
+Markdown is written separately to
+`<batch>\work\step-4.1-spellcheck\<document-id>`; original Step 4 files remain
+unchanged. Step 6 uses this corrected copy when its default output exists and
+rejects it if its source OCR report or Markdown has changed since checking.
+Step 5 continues to crop figures from the original Step 4 layout.
+
+Install the optional offline English/French spelling and Traditional Chinese
+script-safety packages:
+
+```powershell
+python -m pip install -e ".[spellcheck]"
+python -m ocr_pipeline spellcheck-document `
+  --batch "F:\ocr\batch01" `
+  --document-id "B0012-01-01"
+```
+
+Step 4.1 uses Step 4 language metadata when available. Use `--language` to
+override it with `vi`, `en`, `fr`, `zh-Hant`, or `vi+zh-Hant`. If language
+detection is inconclusive, the source text is kept unchanged. The confidence
+threshold defaults to `0.95` and can be set with `--confidence-threshold`.
+This is a heuristic score, **not** a calibrated probability or guarantee;
+benchmark it against reviewed ground truth before production.
+
+English and French use `pyspellchecker`. Vietnamese and Traditional Chinese
+use a local UTF-8 JSON vocabulary supplied with `--dictionary-file`; no
+generic Vietnamese or Traditional Chinese vocabulary is silently substituted.
+The dictionary may also protect names and domain terms:
+
+```json
+{
+  "vi": {
+    "words": {"thanh toán": 1000, "thanh": 500, "toán": 500},
+    "domain_terms": ["Tên riêng"]
+  },
+  "zh-Hant": {
+    "words": {"學習": 1000},
+    "domain_terms": ["古籍專名"]
+  },
+  "en": {
+    "words": {
+      "this": 1000, "is": 1000, "an": 1000,
+      "example": 1000, "examples": 800
+    },
+    "context_phrases": ["an example"],
+    "domain_terms": ["Acme"]
+  },
+  "fr": {"words": {"exemple": 1000}}
+}
+```
+
+`words` values are positive frequencies; lists of words are also accepted
+with a default frequency of one. `context_phrases` can disambiguate candidates
+using local phrases; otherwise context evidence is limited to neighboring
+dictionary matches. `domain_terms` are protected from correction. The
+decision score combines dictionary match, candidate similarity, frequency
+gain, and available context evidence. Ties, possible proper names, unknown
+languages, and candidates below threshold result in `KEEP_ORIGINAL`.
+Traditional Chinese candidates are kept unless the OpenCC guard proves that
+the proposed text is not a Simplified-to-Traditional conversion. No Simplified
+conversion is ever applied.
+
+Every detected candidate is recorded in `correction-log.jsonl` with its
+original text, proposed candidate, score, action, reason, and available
+evidence. The report states that OCR confidence, semantic language-model
+context, and visual evidence are unavailable in the current Step 4 contract;
+they are not fabricated or inferred from TIFFs. The OCR page JSON is copied
+byte-for-byte into the Step 4.1 output, preserving layout metadata.
 
 ## Step 5: cut out figures
 
@@ -305,7 +514,10 @@ python -m ocr_pipeline assemble-document `
 
 By default, Step 6 reads the Step 1, 2, 4, and 5 outputs and writes a portable
 bundle under `<batch>\work\step-6-assemble\<document-id>`. The bundle contains
-`document.md` and an `images\` directory. Optional `--split-report`,
+`document.md` and an `images\` directory. If the default Step 4.1 output is
+present, its corrected Markdown is used while regions remain sourced from
+Step 4. Pass `--spellcheck-output` to select an alternate Step 4.1 folder.
+Optional `--split-report`,
 `--check-report`, `--ocr-output`, `--image-output`, `--description-report`,
 and `--output` arguments override those paths.
 
@@ -343,7 +555,7 @@ python -m ocr_pipeline describe-images `
   --allow-cropped-image-upload
 ```
 
-The default model is `gemini-2.5-flash`. Step 7 writes concise alt text and an
+The default model is `gemini-4-hydrogen`. Step 7 writes concise alt text and an
 optional Mermaid flow/relationship diagram. The command refuses to contact
 Vertex unless `--allow-cropped-image-upload` is provided. Offline tests use a
 fake adapter and require no credentials or network access.
@@ -364,6 +576,10 @@ from page flags (`EMPTY_OCR`, `REPEATED_OCR`, `LOW_VOCABULARY`, `OCR_FAILURE`,
 automatically rejecting a structurally valid bundle. A vocabulary ratio is
 calculated only when both a vocabulary file and pilot-calibrated
 `--vocabulary-threshold` are supplied.
+
+The report sets `ocr_accuracy_status` to `not_assessed`: `bundle_status:
+pass` confirms structural checks, not transcription accuracy. WER/CER require
+reviewed reference text, which this step does not infer from OCR confidence.
 
 ## Step 9: local publication
 

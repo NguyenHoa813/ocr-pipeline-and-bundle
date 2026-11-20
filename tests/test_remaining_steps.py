@@ -192,6 +192,7 @@ class RemainingStepTests(unittest.TestCase):
         )
 
         self.assertEqual(report.bundle_status, "pass")
+        self.assertEqual(report.ocr_accuracy_status, "not_assessed")
         flag_types = {flag.flag_type for flag in report.page_flags}
         self.assertTrue({"EMPTY_OCR", "REPEATED_OCR", "LOW_VOCABULARY", "TIMEOUT"} <= flag_types)
         with flag_log.open(encoding="utf-8", newline="") as file:

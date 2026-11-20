@@ -1,11 +1,13 @@
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol, runtime_checkable
 
 from ocr_pipeline.steps.step1_check_batch import resolve_scan_folder
 
@@ -64,6 +66,50 @@ class OCRModelAdapter(Protocol):
         ...
 
 
+@runtime_checkable
+class TokenUsageAdapter(Protocol):
+    def token_usage(self, raw: object) -> dict[str, int | None] | None:
+        ...
+
+
+@dataclass(frozen=True)
+class ReportedOCRCost:
+    amount: float
+    currency: str
+
+
+@runtime_checkable
+class CostUsageAdapter(Protocol):
+    def cost_usage(self, raw: object) -> ReportedOCRCost | None:
+        """Return provider-reported cost, or None when unavailable."""
+        ...
+
+
+class _InvalidCostError(Step4Error):
+    pass
+
+
+def _read_reported_cost(
+    reader: Callable[[object], ReportedOCRCost | None] | None,
+    raw: object,
+) -> ReportedOCRCost | None:
+    if reader is None:
+        return None
+    cost = reader(raw)
+    if cost is None:
+        return None
+    if (
+        not isinstance(cost, ReportedOCRCost)
+        or type(cost.amount) not in (int, float)
+        or not math.isfinite(cost.amount)
+        or cost.amount < 0
+        or not isinstance(cost.currency, str)
+        or re.fullmatch(r"[A-Z]{3}", cost.currency) is None
+    ):
+        raise _InvalidCostError("OCR adapter returned invalid reported cost metadata.", raw)
+    return cost
+
+
 def load_ocr_adapter(model_name: str, **options: object) -> OCRModelAdapter:
     """Load a built-in or installed third-party OCR adapter plugin."""
     builtin_adapters: dict[str, tuple[str, str]] = {
@@ -74,6 +120,18 @@ def load_ocr_adapter(model_name: str, **options: object) -> OCRModelAdapter:
         "vietocr": (
             "ocr_pipeline.adapters.vietocr_layout",
             "VietOCRLayoutAdapter",
+        ),
+        "gemini": (
+            "ocr_pipeline.adapters.gemini_ocr",
+            "GeminiOCRAdapter",
+        ),
+        "openai": (
+            "ocr_pipeline.adapters.openai_ocr",
+            "OpenAIOCRAdapter",
+        ),
+        "claude": (
+            "ocr_pipeline.adapters.claude_ocr",
+            "ClaudeOCRAdapter",
         ),
     }
     if model_name in builtin_adapters:
@@ -148,6 +206,8 @@ class PageOCRResult:
     raw_output_file: str | None
     error: str | None = None
     duration_seconds: float | None = None
+    token_usage: dict[str, int | None] | None = None
+    reported_cost: ReportedOCRCost | None = None
 
 
 @dataclass
@@ -159,6 +219,8 @@ class DocumentOCRReport:
     status: Literal["pass", "fail"]
     pages: list[PageOCRResult]
     language: str | None = None
+    token_usage: dict[str, object] | None = None
+    cost: dict[str, object] | None = None
 
 
 def _load_document_pages(
@@ -323,6 +385,12 @@ def run_document_ocr(
     page_results: list[PageOCRResult] = []
     normalized_outputs: dict[int, PageOCRContent] = {}
     raw_outputs: dict[int, object] = {}
+    usage_reader: Callable[[object], dict[str, int | None] | None] | None = (
+        adapter.token_usage if isinstance(adapter, TokenUsageAdapter) else None
+    )
+    cost_reader: Callable[[object], ReportedOCRCost | None] | None = (
+        adapter.cost_usage if isinstance(adapter, CostUsageAdapter) else None
+    )
     for page_number in pages:
         page_started = time.perf_counter()
         relative_file = scan_paths.get(page_number)
@@ -363,6 +431,7 @@ def run_document_ocr(
             continue
         try:
             content, raw_output = adapter.recognize(image_path)
+            reported_cost = _read_reported_cost(cost_reader, raw_output)
             duration_seconds = round(time.perf_counter() - page_started, 3)
             normalized_outputs[page_number] = content
             raw_outputs[page_number] = raw_output
@@ -374,6 +443,12 @@ def run_document_ocr(
                     markdown_file=markdown_relative,
                     raw_output_file=f"raw/page-{page_number:05d}.json",
                     duration_seconds=duration_seconds,
+                    token_usage=(
+                        usage_reader(raw_output)
+                        if usage_reader is not None
+                        else None
+                    ),
+                    reported_cost=reported_cost,
                 )
             )
             _LOGGER.info(
@@ -381,11 +456,22 @@ def run_document_ocr(
                 page_number,
                 duration_seconds,
             )
+            _LOGGER.info(
+                "OCR page %05d: token usage=%s; reported cost=%s",
+                page_number, page_results[-1].token_usage, reported_cost,
+            )
         except Step4Error as exc:
             duration_seconds = round(time.perf_counter() - page_started, 3)
             raw_response = getattr(exc, "raw_response", None)
+            error_message = str(exc)
+            failed_cost = None
             if raw_response is not None:
                 raw_outputs[page_number] = raw_response
+                if not isinstance(exc, _InvalidCostError):
+                    try:
+                        failed_cost = _read_reported_cost(cost_reader, raw_response)
+                    except _InvalidCostError as cost_exc:
+                        error_message = f"{error_message}; {cost_exc}"
             page_results.append(
                 PageOCRResult(
                     page_number=page_number,
@@ -397,15 +483,25 @@ def run_document_ocr(
                         if raw_response is not None
                         else None
                     ),
-                    error=str(exc),
+                    error=error_message,
                     duration_seconds=duration_seconds,
+                    token_usage=(
+                        usage_reader(raw_response)
+                        if usage_reader is not None and raw_response is not None
+                        else None
+                    ),
+                    reported_cost=failed_cost,
                 )
             )
             _LOGGER.info(
                 "OCR page %05d: failed (%.3f seconds): %s",
                 page_number,
                 duration_seconds,
-                exc,
+                error_message,
+            )
+            _LOGGER.info(
+                "OCR page %05d: token usage=%s; reported cost=%s",
+                page_number, page_results[-1].token_usage, page_results[-1].reported_cost,
             )
 
     overall_status: Literal["pass", "fail"] = (
@@ -413,6 +509,43 @@ def run_document_ocr(
         if all(page.status in ("success", "blank") for page in page_results)
         else "fail"
     )
+    usage_summary: dict[str, object] | None = None
+    if usage_reader is not None:
+        attempted = [page for page in page_results if page.status != "blank"]
+        reported = [page.token_usage for page in attempted if page.token_usage is not None]
+        usage_summary = {
+            "reported_pages": len(reported),
+            "unreported_pages": len(attempted) - len(reported),
+        }
+        for field in ("prompt_tokens", "output_tokens", "thoughts_tokens",
+                      "cached_tokens", "total_tokens"):
+            values = [usage[field] for usage in reported]
+            usage_summary[field] = (
+                sum(value for value in values if value is not None)
+                if attempted and len(reported) == len(attempted)
+                and all(value is not None for value in values)
+                else None
+            )
+    attempted = [page for page in page_results if page.status != "blank"]
+    reported_costs = [page.reported_cost for page in attempted if page.reported_cost is not None]
+    currencies = {cost.currency for cost in reported_costs}
+    complete_cost = bool(attempted) and len(reported_costs) == len(attempted) and len(currencies) == 1
+    # Never turn missing provider billing data or mixed currencies into a total.
+    cost_summary: dict[str, object] = {
+        "status": (
+            "reported" if complete_cost
+            else "mixed_currencies" if len(currencies) > 1
+            else "partial" if reported_costs
+            else "not_reported"
+        ),
+        "amount": (
+            float(sum((Decimal(str(cost.amount)) for cost in reported_costs), Decimal(0)))
+            if complete_cost else None
+        ),
+        "currency": next(iter(currencies)) if complete_cost else None,
+        "reported_pages": len(reported_costs),
+        "unreported_pages": len(attempted) - len(reported_costs),
+    }
     return (
         DocumentOCRReport(
             schema_version=1,
@@ -422,6 +555,8 @@ def run_document_ocr(
             status=overall_status,
             pages=page_results,
             language=getattr(adapter, "language", None),
+            token_usage=usage_summary,
+            cost=cost_summary,
         ),
         normalized_outputs,
         raw_outputs,

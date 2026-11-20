@@ -7,6 +7,39 @@ from ocr_pipeline.steps.run_tracking import record_step_run
 
 
 class RunTrackingTests(unittest.TestCase):
+    def test_changed_spellcheck_output_marks_assembly_and_quality_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            batch = Path(temporary_directory) / "batch"
+            source = batch / "work" / "step-4-ocr" / "source.md"
+            spellcheck = batch / "work" / "step-4.1-spellcheck" / "corrected.md"
+            assembly = batch / "work" / "step-6-assemble" / "document.md"
+            quality = batch / "work" / "step-8-quality" / "report.json"
+            for path in (source, spellcheck, assembly, quality):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("first version", encoding="utf-8")
+
+            record_step_run(
+                batch, "run-test", "step-4.1", "pass", [source], [spellcheck]
+            )
+            record_step_run(
+                batch, "run-test", "step-6", "pass", [spellcheck], [assembly]
+            )
+            record_step_run(
+                batch, "run-test", "step-8", "pass", [assembly], [quality]
+            )
+            spellcheck.write_text("updated correction", encoding="utf-8")
+            record_step_run(
+                batch, "run-test", "step-4.1", "pass", [source], [spellcheck]
+            )
+
+            run_record = json.loads(
+                (batch / "work" / "runs" / "run-test.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(run_record["steps"]["step-6"]["status"], "stale")
+            self.assertEqual(run_record["steps"]["step-8"]["status"], "stale")
+
     def test_changed_input_marks_downstream_steps_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             batch = Path(temporary_directory) / "batch"

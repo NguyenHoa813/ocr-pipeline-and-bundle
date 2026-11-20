@@ -37,6 +37,7 @@ class QualityReport:
     document_id: str
     run_id: str
     bundle_status: Literal["pass", "fail"]
+    ocr_accuracy_status: Literal["not_assessed"]
     checks: list[str]
     errors: list[str]
     page_flags: list[QualityFlag]
@@ -361,6 +362,7 @@ def check_document_quality(
         document_id=document_id,
         run_id=run_id,
         bundle_status="pass" if not errors else "fail",
+        ocr_accuracy_status="not_assessed",
         checks=checks,
         errors=errors,
         page_flags=page_flags,

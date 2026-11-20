@@ -1,6 +1,7 @@
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 from ocr_pipeline.steps.step1_check_batch import (
@@ -31,6 +32,10 @@ from ocr_pipeline.steps.step4_ocr_pages import (
     run_document_ocr,
     write_document_ocr,
 )
+from ocr_pipeline.steps.step4_1_spellcheck import (
+    Step41Error,
+    spellcheck_document,
+)
 from ocr_pipeline.steps.step5_cut_out_images import (
     Step5Error,
     cut_out_document_images,
@@ -56,11 +61,17 @@ from ocr_pipeline.steps.step9_local_storage import (
     publish_document_bundle,
 )
 from ocr_pipeline.steps.run_tracking import (
+    RUN_ID_PATTERN,
     RunTrackingError,
     new_run_id,
     record_step_run,
 )
 from ocr_pipeline.self_test import SelfTestError, run_self_test
+
+
+class _OCRFileHandler(logging.FileHandler):
+    def handleError(self, record: logging.LogRecord) -> None:
+        raise OSError("Cannot write OCR log file.") from sys.exc_info()[1]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -177,6 +188,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Language supported by the selected model (vietocr: vi or "
         "vi+zh-Hant; tesseract: vi, vi+zh-Hant, zh-Hant, fr, en).",
     )
+    ocr.add_argument(
+        "--gemini-model",
+        default="gemini-4-hydrogen",
+        help="Gemini API model ID, used only with --model gemini.",
+    )
+    ocr.add_argument(
+        "--gemini-thinking",
+        default="low",
+        choices=("low", "medium", "high", "xhigh"),
+        help="Gemini thinking level, used only with --model gemini (default: low).",
+    )
+    ocr.add_argument(
+        "--openai-model",
+        default="gpt-4.1-mini",
+        help="OpenAI vision model ID, used only with --model openai.",
+    )
+    ocr.add_argument(
+        "--claude-model",
+        default="claude-sonnet-4-5",
+        help="Claude vision model ID, used only with --model claude.",
+    )
     ocr.add_argument("--split-report", type=Path)
     ocr.add_argument("--check-report", type=Path)
     ocr.add_argument("--blank-report", type=Path)
@@ -185,6 +217,41 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Output folder; defaults to <batch>\\work\\step-4-ocr"
         "\\<document-id>.",
+    )
+
+    spellcheck = commands.add_parser(
+        "spellcheck-document",
+        help="Conservatively correct OCR text without rerunning OCR.",
+    )
+    spellcheck.add_argument("--batch", type=Path, required=True)
+    spellcheck.add_argument("--document-id", required=True)
+    spellcheck.add_argument(
+        "--ocr-output",
+        type=Path,
+        help="Step 4 output folder; defaults to <batch>\\work\\step-4-ocr"
+        "\\<document-id>.",
+    )
+    spellcheck.add_argument(
+        "--output",
+        type=Path,
+        help="Output folder; defaults to <batch>\\work\\step-4.1-spellcheck"
+        "\\<document-id>.",
+    )
+    spellcheck.add_argument(
+        "--language",
+        choices=("vi", "en", "fr", "zh-Hant", "vi+zh-Hant"),
+        help="Override the OCR language metadata; otherwise detect conservatively.",
+    )
+    spellcheck.add_argument(
+        "--dictionary-file",
+        type=Path,
+        help="Local UTF-8 JSON vocabulary and protected domain terms.",
+    )
+    spellcheck.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.95,
+        help="Heuristic auto-correction threshold (default: 0.95).",
     )
 
     cut = commands.add_parser(
@@ -253,6 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
         "\\<document-id>.",
     )
     assemble.add_argument(
+        "--spellcheck-output",
+        type=Path,
+        help="Optional Step 4.1 output; used automatically when its default "
+        "folder exists.",
+    )
+    assemble.add_argument(
         "--image-output",
         type=Path,
         help="Step 5 output folder; defaults to <batch>\\work\\step-5-images"
@@ -284,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     describe.add_argument("--document-id", required=True)
     describe.add_argument("--project", required=True, help="Google Cloud project ID.")
     describe.add_argument("--location", required=True, help="Vertex AI location.")
-    describe.add_argument("--model", default="gemini-2.5-flash")
+    describe.add_argument("--model", default="gemini-4-hydrogen")
     describe.add_argument(
         "--allow-cropped-image-upload",
         action="store_true",
@@ -323,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     self_test = commands.add_parser(
         "self-test",
-        help="Generate synthetic scans and run all nine steps without cloud access.",
+        help="Generate synthetic scans and run all ten stages without cloud access.",
     )
     self_test.add_argument(
         "--output",
@@ -348,6 +421,7 @@ def _record_failed_run(args: argparse.Namespace, run_id: str, step: str) -> None
         "step-2": batch_root / "work" / "step-2-documents",
         "step-3": batch_root / "work" / "step-3-blank-pages",
         "step-4": batch_root / "work" / "step-4-ocr",
+        "step-4.1": batch_root / "work" / "step-4.1-spellcheck",
         "step-5": batch_root / "work" / "step-5-images",
         "step-6": batch_root / "work" / "step-6-assemble",
         "step-7": batch_root / "work" / "step-7-image-descriptions",
@@ -523,21 +597,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "ocr-document":
+        started = time.perf_counter()
+        file_handler: _OCRFileHandler | None = None
+        step4_logger = logging.getLogger("ocr_pipeline.steps.step4_ocr_pages")
+        file_logger = logging.Logger("ocr_pipeline.external_ocr_run_file")
+        log_path: Path | None = None
         try:
             batch_root = args.batch.resolve()
             scan_folder = resolve_scan_folder(batch_root)
+            external_model = args.model in {"gemini", "openai", "claude"}
+            default_step4 = (
+                f"step-4-ocr-{args.model}" if external_model else "step-4-ocr"
+            )
             output_folder = (
-                args.output
-                or batch_root
-                / "work"
-                / "step-4-ocr"
-                / args.document_id
+                args.output or batch_root / "work" / default_step4 / args.document_id
             ).resolve()
             if output_folder.is_relative_to(scan_folder):
                 raise Step4Error("OCR output must be outside raw scans.")
-            step4_logger = logging.getLogger(
-                "ocr_pipeline.steps.step4_ocr_pages"
-            )
             step4_logger.setLevel(logging.INFO)
             step4_logger.propagate = False
             if not step4_logger.handlers:
@@ -549,7 +625,34 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 step4_logger.addHandler(handler)
-            adapter = load_ocr_adapter(args.model, language=args.language)
+            if not RUN_ID_PATTERN.fullmatch(run_id):
+                raise Step4Error(f"Invalid run ID: {run_id}")
+            output_folder.mkdir(parents=True, exist_ok=True)
+            ocr_log_path = output_folder / f"ocr-{run_id}.log"
+            file_handler = _OCRFileHandler(ocr_log_path, encoding="utf-8")
+            log_path = ocr_log_path
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(levelname)s %(message)s",
+                    datefmt="%H:%M:%S",
+                )
+            )
+            step4_logger.addHandler(file_handler)
+            file_logger.addHandler(file_handler)
+            provider = {"gemini": "Gemini", "openai": "OpenAI", "claude": "Claude"}.get(
+                args.model, args.model
+            )
+            file_logger.info("Starting %s OCR run: %s", provider, run_id)
+            options = {"language": args.language}
+            if args.model == "gemini":
+                options["model"] = args.gemini_model
+                options["thinking_level"] = args.gemini_thinking
+            elif args.model == "openai":
+                options["model"] = args.openai_model
+            elif args.model == "claude":
+                options["model"] = args.claude_model
+            adapter = load_ocr_adapter(args.model, **options)
+            file_logger.info("Model: %s; version: %s", adapter.model_name, adapter.model_version)
             report, normalized, raw = run_document_ocr(
                 batch_root,
                 args.document_id,
@@ -559,10 +662,34 @@ def main(argv: list[str] | None = None) -> int:
                 args.blank_report,
             )
             write_document_ocr(report, normalized, raw, output_folder)
+            summary = (
+                f"OCR {report.status} for {args.document_id} with {report.model}; "
+                f"{len(report.pages)} page(s)."
+            )
+            file_logger.info(summary)
+            file_logger.info("Output: %s", output_folder)
+            file_logger.info("Elapsed time: %.3f seconds", time.perf_counter() - started)
+            file_logger.info(
+                "Token usage: %s",
+                report.token_usage if report.token_usage is not None else "not reported",
+            )
+            file_logger.info("Cost: %s", report.cost)
         except (Step4Error, OSError) as exc:
+            if file_handler is not None:
+                try:
+                    file_logger.error("ERROR: %s", exc)
+                    file_logger.info("Elapsed time: %.3f seconds", time.perf_counter() - started)
+                    file_logger.info("Token usage: not available; cost: not reported")
+                except OSError as log_exc:
+                    print(f"ERROR: {log_exc}", file=sys.stderr)
             print(f"ERROR: {exc}", file=sys.stderr)
             _record_failed_run(args, run_id, "step-4")
             return 2
+        finally:
+            if file_handler is not None:
+                step4_logger.removeHandler(file_handler)
+                file_logger.removeHandler(file_handler)
+                file_handler.close()
 
         record_step_run(
             batch_root,
@@ -588,12 +715,70 @@ def main(argv: list[str] | None = None) -> int:
                 **getattr(adapter, "configuration", {}),
             },
         )
+        print(summary)
+        print(f"Output: {output_folder}")
+        if report.token_usage is not None:
+            print(f"Token usage: {report.token_usage}")
+        print(f"Cost: {report.cost}")
+        if log_path is not None:
+            print(f"Log: {log_path}")
+        return 0 if report.status == "pass" else 1
+
+    if args.command == "spellcheck-document":
+        try:
+            batch_root = args.batch.resolve()
+            source_folder = (
+                args.ocr_output
+                or batch_root / "work" / "step-4-ocr" / args.document_id
+            ).resolve()
+            output_folder = (
+                args.output
+                or batch_root
+                / "work"
+                / "step-4.1-spellcheck"
+                / args.document_id
+            ).resolve()
+            report = spellcheck_document(
+                batch_root,
+                args.document_id,
+                source_folder,
+                output_folder,
+                args.language,
+                args.dictionary_file,
+                args.confidence_threshold,
+            )
+        except (Step41Error, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            _record_failed_run(args, run_id, "step-4.1")
+            return 2
+
+        record_step_run(
+            batch_root,
+            run_id,
+            "step-4.1",
+            "pass",
+            [source_folder]
+            + ([args.dictionary_file] if args.dictionary_file else []),
+            [output_folder],
+            {
+                "language": args.language,
+                "confidence_threshold": args.confidence_threshold,
+                "dictionary_file": (
+                    str(args.dictionary_file.resolve())
+                    if args.dictionary_file
+                    else None
+                ),
+            },
+        )
+        decisions = report.get("decisions")
+        assert isinstance(decisions, dict)
         print(
-            f"OCR {report.status} for {args.document_id} with {report.model}; "
-            f"{len(report.pages)} page(s)."
+            f"Spell checking completed for {args.document_id}: "
+            f"{decisions['AUTO_CORRECT']} auto-correction(s), "
+            f"{decisions['KEEP_ORIGINAL']} kept decision(s)."
         )
         print(f"Output: {output_folder}")
-        return 0 if report.status == "pass" else 1
+        return 0
 
     if args.command == "cut-out-images":
         try:
@@ -643,6 +828,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "assemble-document":
         try:
             batch_root = args.batch.resolve()
+            spellcheck_output = args.spellcheck_output
+            if spellcheck_output is None:
+                default_spellcheck_output = (
+                    batch_root
+                    / "work"
+                    / "step-4.1-spellcheck"
+                    / args.document_id
+                )
+                if default_spellcheck_output.exists():
+                    spellcheck_output = default_spellcheck_output
             result = assemble_document(
                 batch_root,
                 args.document_id,
@@ -653,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.output,
                 args.description_report,
                 args.skip_step7,
+                spellcheck_output_folder=spellcheck_output,
             )
         except (Step6Error, OSError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -671,6 +867,11 @@ def main(argv: list[str] | None = None) -> int:
                 or batch_root / "work" / "step-1-checks" / "batch-report.json",
                 args.ocr_output
                 or batch_root / "work" / "step-4-ocr" / args.document_id,
+                *(
+                    [spellcheck_output]
+                    if spellcheck_output is not None
+                    else []
+                ),
                 args.image_output
                 or batch_root / "work" / "step-5-images" / args.document_id,
             ]
@@ -799,7 +1000,8 @@ def main(argv: list[str] | None = None) -> int:
             {"vocabulary_threshold": args.vocabulary_threshold},
         )
         print(
-            f"Bundle {report.bundle_status}; {len(report.errors)} structural "
+            f"Bundle structural status: {report.bundle_status}; OCR accuracy: "
+            f"{report.ocr_accuracy_status}; {len(report.errors)} structural "
             f"error(s), {len(report.page_flags)} page/bundle flag(s)."
         )
         print(f"Report: {output_path}")

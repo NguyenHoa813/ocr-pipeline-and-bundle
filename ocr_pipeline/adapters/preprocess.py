@@ -40,7 +40,7 @@ class PreparedPage:
 def _ink_projection_score(image: Image.Image, angle: float) -> float:
     rotated = image.rotate(
         angle,
-        resample=Image.BILINEAR,
+        resample=Image.Resampling.BILINEAR,
         expand=False,
         fillcolor=0,
     )
@@ -73,7 +73,7 @@ def estimate_skew_degrees(
     factor = min(1.0, SKEW_SEARCH_SIDE / max(width, height))
     small = image.resize(
         (max(2, int(round(width * factor))), max(2, int(round(height * factor)))),
-        Image.BILINEAR,
+        Image.Resampling.BILINEAR,
     )
     ink = (np.asarray(small) < 128).astype(np.uint8) * 255
     binary = Image.fromarray(ink, mode="L")
@@ -127,7 +127,7 @@ def prepare_page(
                     max(1, int(round(page.width * scale))),
                     max(1, int(round(page.height * scale))),
                 ),
-                Image.LANCZOS,
+                Image.Resampling.LANCZOS,
             )
         else:
             scale = 1.0
@@ -145,7 +145,7 @@ def prepare_page(
         if skew_degrees:
             page = page.rotate(
                 skew_degrees,
-                resample=Image.BICUBIC,
+                resample=Image.Resampling.BICUBIC,
                 expand=False,
                 fillcolor=255,
             )

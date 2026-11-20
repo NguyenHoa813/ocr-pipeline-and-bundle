@@ -346,11 +346,12 @@ class VietOCRAdapter:
                         str(prediction),
                         line.tesseract_text,
                     ))
-                    confidence = float(probability)
+                    confidence = float(probability) if probability is not None else None
                     source = "vietocr"
                 if is_noise_text(text):
                     text = line.tesseract_text
                     source = "tesseract-fallback"
+                    confidence = None
                 if not text:
                     continue
                 text_line = TextLine(

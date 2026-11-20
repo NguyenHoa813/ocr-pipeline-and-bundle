@@ -12,10 +12,20 @@ RunStatus = Literal["pass", "fail", "skipped", "stale"]
 CONFIG_VERSION = "1"
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 INVALIDATED_BY_STEP = {
-    "step-1": ("step-2", "step-3", "step-4", "step-5", "step-6", "step-7", "step-8", "step-9"),
-    "step-2": ("step-3", "step-4", "step-5", "step-6", "step-7", "step-8", "step-9"),
-    "step-3": ("step-4", "step-5", "step-6", "step-7", "step-8", "step-9"),
-    "step-4": ("step-5", "step-6", "step-7", "step-8", "step-9"),
+    "step-1": (
+        "step-2", "step-3", "step-4", "step-4.1", "step-5",
+        "step-6", "step-7", "step-8", "step-9",
+    ),
+    "step-2": (
+        "step-3", "step-4", "step-4.1", "step-5", "step-6",
+        "step-7", "step-8", "step-9",
+    ),
+    "step-3": (
+        "step-4", "step-4.1", "step-5", "step-6", "step-7",
+        "step-8", "step-9",
+    ),
+    "step-4": ("step-4.1", "step-5", "step-6", "step-7", "step-8", "step-9"),
+    "step-4.1": ("step-6", "step-8", "step-9"),
     "step-5": ("step-6", "step-7", "step-8", "step-9"),
     "step-6": ("step-8", "step-9"),
     "step-7": ("step-6", "step-8", "step-9"),
@@ -65,7 +75,7 @@ def record_step_run(
 ) -> Path:
     if not RUN_ID_PATTERN.fullmatch(run_id):
         raise RunTrackingError(f"Invalid run ID: {run_id}")
-    if not re.fullmatch(r"step-[1-9]", step):
+    if not re.fullmatch(r"step-(?:[1-9]|4\.1)", step):
         raise RunTrackingError(f"Invalid pipeline step name: {step}")
     batch_root = Path(batch_root).resolve()
     run_folder = batch_root / "work" / "runs"

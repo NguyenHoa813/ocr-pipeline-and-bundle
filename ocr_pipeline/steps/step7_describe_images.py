@@ -50,7 +50,7 @@ class GeminiVertexAIAdapter:
         self,
         project: str,
         location: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-4-hydrogen",
     ) -> None:
         if not project.strip() or not location.strip() or not model.strip():
             raise Step7Error("Vertex project, location, and model are required.")

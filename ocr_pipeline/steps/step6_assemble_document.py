@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import shutil
@@ -62,6 +63,84 @@ def _read_utf8(path: Path, label: str) -> str:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise Step6Error(f"Cannot read {label} {path}: {exc}") from exc
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_spellcheck_output(
+    spellcheck_folder: Path,
+    ocr_report_path: Path,
+    document_id: str,
+    ocr_pages: dict[int, dict[str, object]],
+) -> None:
+    report = _read_json(
+        spellcheck_folder / "spellcheck-report.json",
+        "Step 4.1 spellcheck report",
+    )
+    if (
+        report.get("schema_version") != 1
+        or report.get("document_id") != document_id
+        or report.get("status") != "pass"
+    ):
+        raise Step6Error(
+            "Step 4.1 report is invalid, failed, or belongs to another document."
+        )
+    if report.get("source_ocr_report_sha256") != _sha256(ocr_report_path):
+        raise Step6Error("Step 4.1 output is stale for the current Step 4 report.")
+    log_path = _contained_file(
+        spellcheck_folder,
+        report.get("log_file"),
+        "Step 4.1 correction log",
+    )
+    if report.get("correction_log_sha256") != _sha256(log_path):
+        raise Step6Error("Step 4.1 correction log checksum is invalid.")
+    source_pages = _read_json(
+        spellcheck_folder / "source-pages.json",
+        "Step 4.1 source-page checksums",
+    )
+    output_pages = report.get("output_page_sha256")
+    if not isinstance(output_pages, dict):
+        raise Step6Error("Step 4.1 output-page checksums are invalid.")
+    page_paths: set[str] = set()
+    for page in ocr_pages.values():
+        relative = page.get("markdown_file")
+        if not isinstance(relative, str):
+            raise Step6Error("Step 4 report has invalid Markdown paths.")
+        page_paths.add(relative)
+    if set(source_pages) != page_paths:
+        raise Step6Error("Step 4.1 source pages do not match Step 4.")
+    if set(output_pages) != page_paths:
+        raise Step6Error("Step 4.1 output pages do not match Step 4.")
+    for page in ocr_pages.values():
+        relative = page.get("markdown_file")
+        if not isinstance(relative, str):
+            raise Step6Error("Step 4 report has an invalid Markdown path.")
+        source_hash = source_pages.get(relative)
+        if not isinstance(source_hash, str):
+            raise Step6Error("Step 4.1 source-page checksums are invalid.")
+        source_markdown = _contained_file(
+            ocr_report_path.parent,
+            relative,
+            "Step 4 OCR Markdown",
+        )
+        if source_hash != _sha256(source_markdown):
+            raise Step6Error("Step 4.1 output is stale for the current OCR text.")
+        corrected_markdown = _contained_file(
+            spellcheck_folder,
+            relative,
+            "Step 4.1 corrected Markdown",
+        )
+        output_hash = output_pages.get(relative)
+        if not isinstance(output_hash, str) or output_hash != _sha256(
+            corrected_markdown
+        ):
+            raise Step6Error("Step 4.1 corrected Markdown checksum is invalid.")
 
 
 def _is_plain_paragraph(block: str) -> bool:
@@ -417,6 +496,7 @@ def assemble_document(
     output_folder: Path | None = None,
     description_report_path: Path | None = None,
     allow_missing_descriptions: bool = False,
+    spellcheck_output_folder: Path | None = None,
 ) -> AssemblyResult:
     """Create a portable Markdown-and-images bundle from pipeline outputs."""
     if not DOCUMENT_ID_PATTERN.fullmatch(document_id):
@@ -438,6 +518,17 @@ def assemble_document(
     ocr_output_folder = Path(
         ocr_output_folder or work_folder / "step-4-ocr" / document_id
     ).resolve()
+    if spellcheck_output_folder is None:
+        default_spellcheck_folder = (
+            work_folder / "step-4.1-spellcheck" / document_id
+        ).resolve()
+        spellcheck_output_folder = (
+            default_spellcheck_folder
+            if default_spellcheck_folder.exists()
+            else None
+        )
+    else:
+        spellcheck_output_folder = Path(spellcheck_output_folder).resolve()
     image_output_folder = Path(
         image_output_folder or work_folder / "step-5-images" / document_id
     ).resolve()
@@ -460,6 +551,13 @@ def assemble_document(
         document_id,
         pages,
     )
+    if spellcheck_output_folder is not None:
+        _validate_spellcheck_output(
+            spellcheck_output_folder,
+            ocr_output_folder / "ocr-report.json",
+            document_id,
+            ocr_pages,
+        )
     image_records = _load_image_records(
         image_output_folder / "cut-out-report.json",
         document_id,
@@ -495,9 +593,13 @@ def assemble_document(
             raise Step6Error(f"Source scan is missing or invalid: {relative_scan}")
         page = ocr_pages[page_number]
         markdown_path = _contained_file(
-            ocr_output_folder,
+            spellcheck_output_folder or ocr_output_folder,
             page.get("markdown_file"),
-            f"Page {page_number:05d} OCR Markdown",
+            (
+                f"Page {page_number:05d} Step 4.1 corrected Markdown"
+                if spellcheck_output_folder is not None
+                else f"Page {page_number:05d} OCR Markdown"
+            ),
         )
         page_text[page_number] = unicodedata.normalize(
             "NFC",

@@ -21,6 +21,7 @@ from ocr_pipeline.steps.step4_ocr_pages import (
     run_document_ocr,
     write_document_ocr,
 )
+from ocr_pipeline.steps.step4_1_spellcheck import spellcheck_document
 from ocr_pipeline.steps.step5_cut_out_images import (
     cut_out_document_images,
     write_cut_out_report,
@@ -46,12 +47,13 @@ class SelfTestError(Exception):
 class _FakeOCRAdapter:
     model_name = "self-test-ocr"
     model_version = "1"
+    language = "en"
 
     def recognize(self, image_path: Path) -> tuple[PageOCRContent, object]:
         page_number = int(image_path.stem.rsplit("-", 1)[1])
         content = {
             1: PageOCRContent(
-                markdown="# Sample document\n\nA generated first page.",
+                markdown="# Sample document\n\nA generated first page with an exampel.",
                 regions=[
                     LayoutRegion(type="heading", text="Sample document"),
                     LayoutRegion(
@@ -97,7 +99,7 @@ class SelfTestResult:
 
 
 def run_self_test(output_root: Path, run_id: str) -> SelfTestResult:
-    """Generate TIFF fixtures and run all nine steps without network access."""
+    """Generate TIFF fixtures and run all ten stages without network access."""
     output_root = Path(output_root).resolve()
     if output_root.exists():
         raise SelfTestError(f"Self-test output already exists: {output_root}")
@@ -225,6 +227,52 @@ def run_self_test(output_root: Path, run_id: str) -> SelfTestResult:
         {"model": "self-test-ocr", "model_version": "1"},
     )
 
+    dictionary_path = (
+        batch_root / "work" / "spellcheck-dictionaries" / "self-test.json"
+    )
+    dictionary_path.parent.mkdir(parents=True, exist_ok=True)
+    dictionary_path.write_text(
+        json.dumps(
+            {"en": {"words": {"this": 100, "is": 100, "an": 100, "example": 100}}},
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    spellcheck_folder = (
+        batch_root / "work" / "step-4.1-spellcheck" / document_id
+    )
+    spellcheck_report = spellcheck_document(
+        batch_root,
+        document_id,
+        ocr_folder,
+        spellcheck_folder,
+        dictionary_file=dictionary_path,
+    )
+    decisions = spellcheck_report.get("decisions")
+    if not isinstance(decisions, dict) or decisions.get("AUTO_CORRECT") != 1:
+        raise SelfTestError("Generated OCR typo was not auto-corrected in Step 4.1.")
+    if (
+        (spellcheck_folder / "pages" / "page-00001.md")
+        .read_text(encoding="utf-8")
+        .find("an example.")
+        < 0
+    ):
+        raise SelfTestError("Step 4.1 did not write the corrected text copy.")
+    if "exampel" not in (
+        ocr_folder / "pages" / "page-00001.md"
+    ).read_text(encoding="utf-8"):
+        raise SelfTestError("Step 4.1 modified the original OCR text.")
+    record_step_run(
+        batch_root,
+        run_id,
+        "step-4.1",
+        "pass",
+        [ocr_folder, dictionary_path],
+        [spellcheck_folder],
+        {"confidence_threshold": 0.95, "language": None},
+    )
+
     image_folder = batch_root / "work" / "step-5-images" / document_id
     crop_report = cut_out_document_images(batch_root, document_id)
     write_cut_out_report(crop_report, image_folder)
@@ -271,11 +319,23 @@ def run_self_test(output_root: Path, run_id: str) -> SelfTestResult:
         run_id,
         "step-6",
         "pass",
-        [split_folder, report_folder, ocr_folder, image_folder, description_path],
+        [
+            split_folder,
+            report_folder,
+            ocr_folder,
+            spellcheck_folder,
+            image_folder,
+            description_path,
+        ],
         [bundle.output_folder],
     )
     markdown = (bundle.output_folder / "document.md").read_text(encoding="utf-8")
-    if "```mermaid" not in markdown or "printed" in markdown:
+    if (
+        "```mermaid" not in markdown
+        or "printed" in markdown
+        or "an example." not in markdown
+        or "exampel" in markdown
+    ):
         raise SelfTestError("Generated Markdown did not assemble Step 7 outputs.")
 
     quality_folder = batch_root / "work" / "step-8-quality"
@@ -326,6 +386,7 @@ def run_self_test(output_root: Path, run_id: str) -> SelfTestResult:
         "document-splitting",
         "blank-page-preservation",
         "mock-local-ocr",
+        "automatic-spellcheck-with-immutable-ocr-source",
         "lossless-figure-crop",
         "mock-image-description",
         "markdown-assembly",

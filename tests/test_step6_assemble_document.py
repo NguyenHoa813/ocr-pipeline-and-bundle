@@ -9,6 +9,7 @@ from ocr_pipeline.steps.step6_assemble_document import (
     Step6Error,
     assemble_document,
 )
+from ocr_pipeline.steps.step4_1_spellcheck import spellcheck_document
 
 
 class Step6Tests(unittest.TestCase):
@@ -173,6 +174,68 @@ class Step6Tests(unittest.TestCase):
         self.assertIn("![Sơ đồ thiết bị](images/p001-1.png)", markdown)
         self.assertTrue(markdown.endswith("<!-- page 2 -->\n"))
         self.assertTrue((self.output / "images" / "p001-1.png").is_file())
+
+    def test_assembly_uses_step41_markdown_and_original_layout(self) -> None:
+        source_markdown = self.pages_folder / "page-00001.md"
+        source_markdown.write_text("This is an exampel.", encoding="utf-8")
+        report_path = self.ocr_folder / "ocr-report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["language"] = "en"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        original_page_json = (
+            self.pages_folder / "page-00001.json"
+        ).read_bytes()
+        dictionary = self.batch / "spellcheck-dictionary.json"
+        dictionary.write_text(
+            json.dumps(
+                {"en": {"words": {"this": 100, "is": 100, "an": 100, "example": 100}}}
+            ),
+            encoding="utf-8",
+        )
+
+        spellcheck_document(
+            self.batch,
+            "B0012-01-01",
+            self.ocr_folder,
+            dictionary_file=dictionary,
+        )
+        assemble_document(self.batch, "B0012-01-01")
+
+        markdown = (self.output / "document.md").read_text(encoding="utf-8")
+        self.assertIn("This is an example.", markdown)
+        self.assertNotIn("exampel", markdown)
+        self.assertEqual(
+            source_markdown.read_text(encoding="utf-8"),
+            "This is an exampel.",
+        )
+        self.assertEqual(
+            (self.pages_folder / "page-00001.json").read_bytes(),
+            original_page_json,
+        )
+        self.assertEqual(
+            (self.pages_folder / "page-00001.json").read_bytes(),
+            (
+                self.work
+                / "step-4.1-spellcheck"
+                / "B0012-01-01"
+                / "pages"
+                / "page-00001.json"
+            ).read_bytes(),
+        )
+        corrected_markdown = (
+            self.work
+            / "step-4.1-spellcheck"
+            / "B0012-01-01"
+            / "pages"
+            / "page-00001.md"
+        )
+        corrected_markdown.write_text("Unlogged edit.", encoding="utf-8")
+        with self.assertRaisesRegex(Step6Error, "checksum"):
+            assemble_document(self.batch, "B0012-01-01")
+        corrected_markdown.write_text("This is an example.", encoding="utf-8")
+        source_markdown.write_text("Changed OCR source.", encoding="utf-8")
+        with self.assertRaisesRegex(Step6Error, "stale"):
+            assemble_document(self.batch, "B0012-01-01")
 
     def test_assembly_rejects_failed_ocr(self) -> None:
         report_path = self.ocr_folder / "ocr-report.json"

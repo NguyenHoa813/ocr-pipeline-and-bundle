@@ -16,6 +16,13 @@ dependencies = [
 
 [project.optional-dependencies]
 vertex = ["google-genai>=1.0"]
+gemini = ["google-genai>=1.0"]
+openai = ["openai>=1.66,<3"]
+claude = ["anthropic>=0.40,<1"]
+spellcheck = [
+    "pyspellchecker>=0.8.2,<1",
+    "opencc-python-reimplemented>=0.1.7,<1",
+]
 layout = [
     "paddleocr>=3.7.0,<4",
     "paddlepaddle>=3.3.1,<4",
@@ -29,6 +36,9 @@ ocr-pipeline = "ocr_pipeline.cli:main"
 [project.entry-points."ocr_pipeline.ocr_adapters"]
 tesseract = "ocr_pipeline.adapters.tesseract_ocr:TesseractOCRAdapter"
 vietocr = "ocr_pipeline.adapters.vietocr_layout:VietOCRLayoutAdapter"
+gemini = "ocr_pipeline.adapters.gemini_ocr:GeminiOCRAdapter"
+openai = "ocr_pipeline.adapters.openai_ocr:OpenAIOCRAdapter"
+claude = "ocr_pipeline.adapters.claude_ocr:ClaudeOCRAdapter"
 
 [tool.setuptools.packages.find]
 include = ["ocr_pipeline*"]

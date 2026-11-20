@@ -33,7 +33,7 @@ class PaddleOCRAdapterTests(unittest.TestCase):
                         options.update(kwargs)
 
                 paddleocr = ModuleType("paddleocr")
-                paddleocr.PPStructureV3 = FakePPStructure
+                setattr(paddleocr, "PPStructureV3", FakePPStructure)
                 with patch.dict(sys.modules, {"paddleocr": paddleocr}):
                     adapter = PaddleOCRAdapter(language=language)
 
@@ -212,7 +212,7 @@ class PaddleOCRAdapterTests(unittest.TestCase):
                 adapter.recognize(image_path)
 
         raw_response = context.exception.raw_response
-        self.assertIsInstance(raw_response, dict)
+        assert isinstance(raw_response, dict)
         self.assertEqual(raw_response["result"], raw_result)
         self.assertEqual(
             adapter._engine.options["text_det_limit_side_len"],
